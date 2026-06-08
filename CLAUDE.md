@@ -75,7 +75,7 @@ arthroscopy_poc/
 
 ### Install
 ```bash
-pip install -e ".[dev]"
+pip install -r requirements.txt
 ```
 
 ### Generate a small test dataset (1 experiment, no multiprocessing)

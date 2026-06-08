@@ -1,0 +1,18 @@
+# Core simulation
+torch>=2.1
+numpy>=1.26
+scipy>=1.11
+matplotlib>=3.8
+
+# Config management
+pyrallis>=0.3.1
+
+# Data storage
+h5py>=3.10
+tqdm>=4.66
+pillow>=10.0
+
+# Dev / testing
+pytest>=7.4
+jupyter>=1.0
+ipykernel>=6.0
