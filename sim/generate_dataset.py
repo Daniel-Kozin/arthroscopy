@@ -25,7 +25,8 @@ import numpy as np
 import pyrallis
 import torch
 
-from sim.configs import ExperimentConfig, DatasetConfig, SimulationConfig
+from data.configs import DatasetConfig
+from sim.configs import ExperimentConfig, SimulationConfig
 from sim.tissue import build_tissue, scan_probe_positions
 from sim.shapes import create_circular_probe
 from sim.simulation import SoftObjectSimulation

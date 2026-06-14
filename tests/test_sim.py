@@ -100,3 +100,114 @@ def test_sensor_reading_shape():
     sim = SoftObjectSimulation([tissue, probe], sim_config)
     reading = sim.get_aggregated_sensor()
     assert reading.shape == (3,)
+
+
+# ---------------------------------------------------------------------------
+# Sensor wrench transform: friction + remote (shaft-mounted) F/T sensor
+#
+# These tests evaluate get_sensor_reading() on the *rest* configuration
+# (no minimize_energy call): the tissue top edge is perfectly flat at
+# y = height, so penetration depends only on each probe vertex's y, giving
+# an exactly mirror-symmetric contact pattern about x_center = 0.5. This
+# makes the expected results exact (to float precision), not approximate.
+# ---------------------------------------------------------------------------
+
+def _contact_sim(friction_coeff: float = 0.0, shaft_length: float = 0.0) -> SoftObjectSimulation:
+    """Probe resting with its lower half penetrating a flat tissue surface."""
+    tissue_config = TissueConfig(width=1.0, height=0.3, grid_size=0.1, n_zones=1)
+    sim_config = SimulationConfig(
+        steps=1,
+        frames=1,
+        warmup=False,
+        collision_spring_constant=0.05,
+        probe_force_noise_std=0.0,
+        friction_coeff=friction_coeff,
+        shaft_length=shaft_length,
+    )
+    tissue, _ = build_tissue(tissue_config, rng=np.random.default_rng(0))
+    probe = create_circular_probe(
+        radius=0.04, num_points=8, x_center=0.5, y_center=tissue_config.height - 0.02,
+    )
+    return SoftObjectSimulation([tissue, probe], sim_config)
+
+
+def test_sensor_force_invariant_to_shaft_length():
+    """Net (Fx, Fy) is a rigid-body force balance: it must not depend on
+    where along the shaft the sensor sits."""
+    sim = _contact_sim(friction_coeff=0.2, shaft_length=0.0)
+    sim.shapes[1].last_velocity = (0.2, 0.0)  # sliding -> Fx != 0
+
+    fx0, fy0, _ = sim.get_aggregated_sensor()
+
+    sim.config.shaft_length = 0.5
+    fx1, fy1, _ = sim.get_aggregated_sensor()
+
+    assert fx0 == pytest.approx(fx1)
+    assert fy0 == pytest.approx(fy1)
+
+
+def test_sensor_symmetric_centered_poke_zero_moment():
+    """Uniform tissue, centred poke, no friction -> Mz == 0 for any shaft length."""
+    sim = _contact_sim(friction_coeff=0.0, shaft_length=0.0)
+
+    _, fy0, mz0 = sim.get_aggregated_sensor()
+    assert fy0 > 0  # sanity: probe is actually in contact
+
+    sim.config.shaft_length = 0.3
+    _, _, mz1 = sim.get_aggregated_sensor()
+
+    assert mz0 == pytest.approx(0.0, abs=1e-6)
+    assert mz1 == pytest.approx(0.0, abs=1e-6)
+
+
+def test_sensor_moment_scales_with_shaft_length():
+    """With friction (Fx != 0), relocating the sensor by L shifts Mz linearly
+    by -L * Fx (forces are fixed, only the moment arm changes)."""
+    sim = _contact_sim(friction_coeff=0.3, shaft_length=0.0)
+    sim.shapes[1].last_velocity = (0.2, 0.0)
+
+    fx, _, mz0 = sim.get_aggregated_sensor()
+    assert fx != pytest.approx(0.0)  # friction must be active
+
+    sim.config.shaft_length = 0.4
+    _, _, mz1 = sim.get_aggregated_sensor()
+    sim.config.shaft_length = 0.8
+    _, _, mz2 = sim.get_aggregated_sensor()
+
+    # Forces are constant w.r.t. L, so Mz(L) is exactly linear in L.
+    assert (mz1 - mz0) == pytest.approx(0.5 * (mz2 - mz0), rel=1e-5)
+    assert mz1 != pytest.approx(mz0)
+
+
+def test_sensor_legacy_formula_at_zero_shaft_length():
+    """shaft_length=0, friction_coeff=0 reproduces the tip-centred moment
+    formula Mz = (r x F)_z = dx*fy - dy*fx about the probe centre, exactly."""
+    sim = _contact_sim(friction_coeff=0.0, shaft_length=0.0)
+
+    probe_verts = sim.shapes[1].vertices[sim.shapes[1].boundary_idx].detach().numpy()
+    probe_center = probe_verts.mean(axis=0)
+
+    readings = sim.get_sensor_reading()
+    for v, (fx, fy, mz) in zip(probe_verts, readings):
+        dx, dy = v[0] - probe_center[0], v[1] - probe_center[1]
+        assert mz == pytest.approx(dx * fy - dy * fx, abs=1e-6)
+
+
+def test_sensor_moment_sign_convention():
+    """Pin the sign convention: a vertex to the right of the probe centre
+    (dx > 0) with a purely upward contact force (fy > 0, fx == 0) must give
+    Mz = dx*fy > 0 (standard right-hand-rule / counterclockwise), not < 0."""
+    sim = _contact_sim(friction_coeff=0.0, shaft_length=0.0)
+
+    probe_verts = sim.shapes[1].vertices[sim.shapes[1].boundary_idx].detach().numpy()
+    probe_center = probe_verts.mean(axis=0)
+
+    readings = sim.get_sensor_reading()
+    found_right_side_contact = False
+    for v, (fx, fy, mz) in zip(probe_verts, readings):
+        dx = v[0] - probe_center[0]
+        if fy > 0 and fx == 0.0 and dx > 1e-6:
+            found_right_side_contact = True
+            assert mz == pytest.approx(dx * fy, abs=1e-6)
+            assert mz > 0
+    assert found_right_side_contact  # sanity: this scenario actually occurs

@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import pyrallis
 
-from sim.configs import TrainingConfig
+from training.configs import TrainingConfig
 from data.dataset import make_dataloaders
 from model.model import ArthroscopyModel
 from training.losses import MSELoss, HuberLoss

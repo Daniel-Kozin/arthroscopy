@@ -33,3 +33,5 @@ simulation:
   save_images: false
   save_video: false
   opaque_model: false
+  friction_coeff: 0.0
+  shaft_length: 0.0

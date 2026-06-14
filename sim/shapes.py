@@ -27,6 +27,9 @@ class SoftShape:
         self.frozen_mask = torch.ones_like(self.vertices, requires_grad=False)
         self.frozen_mask[self.fixed_vertices_idx] = 0
         self.trajectory = trajectory
+        # Velocity applied by the most recent update_positions() call. Used by
+        # the sensor model (e.g. to pick a Coulomb-friction sliding direction).
+        self.last_velocity = (0.0, 0.0)
 
     def reset_positions(self):
         with torch.no_grad():
@@ -55,6 +58,7 @@ class SoftShapeSpringMass(SoftShape):
 
     def update_positions(self, dt: float):
         vel = torch.tensor(self.trajectory.step(dt), dtype=torch.float32, requires_grad=False)
+        self.last_velocity = (float(vel[0]), float(vel[1]))
         with torch.no_grad():
             self.vertices[self.fixed_vertices_idx] = (
                 self.vertices[self.fixed_vertices_idx] + dt * vel
@@ -149,6 +153,7 @@ class SoftShapeFiniteElement(SoftShape):
 
     def update_positions(self, dt: float):
         vel = torch.tensor(self.trajectory.step(dt), dtype=torch.float32, requires_grad=False)
+        self.last_velocity = (float(vel[0]), float(vel[1]))
         with torch.no_grad():
             self.vertices[self.fixed_vertices_idx] = (
                 self.vertices[self.fixed_vertices_idx] + dt * vel

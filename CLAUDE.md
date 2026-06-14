@@ -23,13 +23,14 @@ arthroscopy_poc/
 ├── configs/
 │   └── default.yaml        ← default simulation config
 ├── sim/                    ← simulation module
-│   ├── configs.py          ← ALL config dataclasses
+│   ├── configs.py          ← simulation config dataclasses (Tissue, Probe, Simulation, Experiment)
 │   ├── trajectory.py       ← probe movement trajectories
 │   ├── shapes.py           ← FEM + spring-mass shapes (SoftShapeFiniteElement, etc.)
 │   ├── tissue.py           ← rectangle tissue phantom builder
 │   ├── simulation.py       ← SoftObjectSimulation engine
 │   └── generate_dataset.py ← parallel dataset generation script
 ├── data/
+│   ├── configs.py          ← dataset generation config (DatasetConfig)
 │   ├── dataset.py          ← PyTorch Dataset + DataLoader helpers
 │   └── preprocess.py       ← raw sim output → HDF5
 ├── model/
@@ -37,6 +38,7 @@ arthroscopy_poc/
 │   ├── decoder.py          ← StiffnessDecoder (MLP)
 │   └── model.py            ← ArthroscopyModel (full pipeline)
 ├── training/
+│   ├── configs.py          ← model + training config (ModelConfig, TrainingConfig)
 │   ├── losses.py           ← MSE, Huber, RankingLoss
 │   └── train.py            ← training loop
 └── tests/
@@ -104,15 +106,20 @@ python -m training.train \
 ---
 
 ## Config System
-All configs are in `sim/configs.py` as pyrallis dataclasses.
-Load from YAML: `pyrallis.parse(config_class=ExperimentConfig, config_path="configs/default.yaml", args=[])`
+All configs are pyrallis dataclasses, split by concern:
 
-Key config classes:
-- `TissueConfig` — tissue geometry and stiffness range
-- `SimulationConfig` — FEM optimizer, noise, saving
-- `DatasetConfig` — dataset generation parameters
-- `ModelConfig` → `EncoderConfig` + `DecoderConfig`
-- `TrainingConfig` — training hyperparameters
+- `sim/configs.py` — simulation physics
+  - `TissueConfig` — tissue geometry and stiffness range
+  - `ProbeConfig` / `TrajectoriesConfig` — probe geometry and motion
+  - `SimulationConfig` — FEM optimizer, noise, saving
+  - `ExperimentConfig` — top-level (Tissue + Probe + Simulation)
+- `data/configs.py` — dataset generation
+  - `DatasetConfig` — dataset generation parameters
+- `training/configs.py` — model + training
+  - `ModelConfig` → `EncoderConfig` + `DecoderConfig`
+  - `TrainingConfig` — training hyperparameters
+
+Load from YAML: `pyrallis.parse(config_class=ExperimentConfig, config_path="configs/default.yaml", args=[])`
 
 ---
 

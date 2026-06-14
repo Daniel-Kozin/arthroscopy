@@ -34,6 +34,16 @@ class SoftObjectSimulation:
         self.dt = config.dt
         self.k_collision = config.collision_spring_constant
 
+        # Precompute tissue geometry for collision detection.
+        # We identify the top-edge vertices by their original y position so we can
+        # track the *deformed* surface height during optimisation.
+        orig = shapes[0].original_positions.numpy()
+        y_max = float(orig[:, 1].max())
+        self._top_edge_idx = np.where(np.isclose(orig[:, 1], y_max))[0]
+        self._tissue_x_min = float(orig[:, 0].min())
+        self._tissue_x_max = float(orig[:, 0].max())
+        self._tissue_y_max = y_max
+
     # ------------------------------------------------------------------
     # Geometry helpers
     # ------------------------------------------------------------------
@@ -94,31 +104,88 @@ class SoftObjectSimulation:
         """
         Returns a (N_probe_verts, 3) array of [Fx, Fy, Mz] per probe vertex.
 
-        Mz (moment about probe centroid) is Fx*(dy) - Fy*(dx) where (dx,dy) is
-        the vector from probe center to the contact point.
+        Force model: for each probe vertex that is below the deformed tissue
+        surface, the tissue pushes the probe upward with a normal reaction
+        Fy = 2k * penetration (consistent with the collision energy
+        E = k * penetration²). If `friction_coeff` (mu) > 0, a Coulomb
+        tangential reaction Fx = -mu * Fy * sign(vx_probe) opposes the
+        probe's horizontal sliding motion (vx_probe == 0 -> Fx = 0).
+
+        Sensor wrench transform (probe tip -> remote F/T sensor on the shaft)
+        ─────────────────────────────────────────────────────────────────────
+        The real F/T sensor sits on the handle, a distance `shaft_length` (L)
+        up the probe shaft from the contact tip — not at the tip itself. For
+        a rigid probe in quasi-static equilibrium this only changes where the
+        moment is taken about; it does NOT change the net force:
+
+          * Force is unchanged: ΣF=0 has no distance term, so
+            F_sensor = F_contact = Σ f_n. We do NOT scale/attenuate forces
+            by shaft length.
+          * Moment depends on sensor location: Mz_sensor is computed directly
+            about the sensor point s = probe_centre + (0, L), using the
+            standard right-hand-rule convention Mz = (r x F)_z, i.e.
+              Mz_sensor = Σ [ (p_n_x - s_x) * f_n_y - (p_n_y - s_y) * f_n_x ]
+            (Equivalently Mz_sensor = Mz_about_tip + r × F.)
+          * With L=0, s == probe_centre and this reduces exactly to the
+            original tip-centred formula (legacy/backward-compatible).
+
+        Mz interpretation: zero when contact is symmetric (uniform tissue,
+        centred poke, no friction), non-zero when the probe straddles a
+        stiffness zone boundary (asymmetric Fy) or when friction (Fx != 0)
+        is combined with a nonzero shaft length L.
+
+        Note: this intentionally does NOT model the cannula/portal reaction
+        (a sideways constraint force on the shaft from the trocar), which
+        would break F_sensor = F_contact. Out of scope for now.
         """
-        tissue_boundary = self.shapes[0].vertices[self.shapes[0].boundary_idx].detach().numpy()
+        top_edge = self.shapes[0].vertices[self._top_edge_idx].detach().numpy()
         probe_verts = self.shapes[1].vertices[self.shapes[1].boundary_idx].detach().numpy()
         probe_center = probe_verts.mean(axis=0)
-
         noise_std = self.config.probe_force_noise_std
+        mu = self.config.friction_coeff
+
+        # Sensor point: offset from the probe centre along the shaft's
+        # vertical axis. L=0 -> sensor co-located with the tip (legacy).
+        sensor_x = probe_center[0]
+        sensor_y = probe_center[1] + self.config.shaft_length
+
+        # Coulomb friction direction: opposes the probe's horizontal sliding
+        # velocity. No horizontal motion -> no tangential (static) force.
+        probe_vx = self.shapes[1].last_velocity[0]
+        slip_sign = np.sign(probe_vx)
+
         readings = []
         for v in probe_verts:
-            if self._point_in_polygon(v, tissue_boundary):
-                _, vec = self._closest_edge(v, tissue_boundary)
-                fx, fy = vec.detach().numpy()
+            vx, vy = float(v[0]), float(v[1])
+            if self._tissue_x_min <= vx <= self._tissue_x_max:
+                nearest = int(np.abs(top_edge[:, 0] - vx).argmin())
+                surface_y = float(top_edge[nearest, 1])
+                penetration = surface_y - vy
+            else:
+                penetration = -1.0
+
+            if penetration > 0:
+                fy = 2.0 * self.k_collision * penetration   # normal reaction
+                fx = -mu * fy * slip_sign                    # Coulomb friction reaction
             else:
                 fx, fy = 0.0, 0.0
 
             fx += np.random.randn() * noise_std
             fy += np.random.randn() * noise_std
 
-            dx, dy = v[0] - probe_center[0], v[1] - probe_center[1]
-            mz = float(fx * dy - fy * dx)
-
+            # Moment about the SENSOR point (not the probe tip). Forces are
+            # unchanged; only this lever arm shifts with shaft_length.
+            dx = vx - sensor_x
+            dy = vy - sensor_y
+            # Standard 2D moment: Mz = (r x F)_z = dx*fy - dy*fx,
+            # with (dx, dy) = vertex - sensor_point. (Previous code used the
+            # negated convention fx*dy - fy*dx; flipped here so Mz matches a
+            # real sensor and composes correctly with r x F in any future
+            # wrench transform.)
+            mz = float(dx * fy - dy * fx)
             readings.append([fx, fy, mz])
 
-        return np.array(readings, dtype=np.float32)  # (N, 3)
+        return np.array(readings, dtype=np.float32)
 
     def get_aggregated_sensor(self) -> np.ndarray:
         """
@@ -127,6 +194,30 @@ class SoftObjectSimulation:
         """
         readings = self.get_sensor_reading()
         return readings.sum(axis=0)  # (3,)
+
+    def get_contact_point(self) -> np.ndarray | None:
+        """
+        Returns the centroid of probe vertices currently inside the tissue,
+        or None when the probe is not in contact.
+
+        Uses axis-aligned bounding box of the tissue rest configuration instead
+        of the polygon test (boundary vertices are not stored in perimeter order,
+        making the ray-casting test unreliable).
+        """
+        orig = self.shapes[0].original_positions.numpy()
+        x_min, y_min = orig.min(axis=0)
+        x_max, y_max = orig.max(axis=0)
+
+        probe_verts = (
+            self.shapes[1].vertices[self.shapes[1].boundary_idx].detach().numpy()
+        )
+        inside = [
+            v for v in probe_verts
+            if x_min <= v[0] <= x_max and y_min <= v[1] <= y_max
+        ]
+        if not inside:
+            return None
+        return np.mean(inside, axis=0)
 
     # ------------------------------------------------------------------
     # Energy minimization
@@ -143,12 +234,23 @@ class SoftObjectSimulation:
             optimizer.zero_grad()
             energy = sum(s.internal_energy() for s in self.shapes)
 
-            # Collision penalty
-            tissue_boundary = self.shapes[0].vertices[self.shapes[0].boundary_idx]
+            # Collision penalty: for every probe vertex that sits below the
+            # deformed tissue surface, add  k * penetration².
+            #
+            # top_edge_verts is re-sliced inside closure so a fresh computation
+            # graph is built on every call (avoids retain_graph errors).
+            # surface_y is a real tensor → gradient flows back to tissue. ✓
+            # The probe vertex gradient is zeroed by frozen_mask below. ✓
+            top_edge_verts = self.shapes[0].vertices[self._top_edge_idx]
             for v in self.shapes[1].vertices[self.shapes[1].boundary_idx]:
-                if self._point_in_polygon(v.detach().numpy(), tissue_boundary.detach().numpy()):
-                    _, dist, _ = self._closest_edge_tensor(v, tissue_boundary)
-                    energy = energy + self.k_collision * dist ** 2
+                vx = v[0].item()
+                if not (self._tissue_x_min <= vx <= self._tissue_x_max):
+                    continue
+                nearest = int((top_edge_verts[:, 0].detach() - vx).abs().argmin())
+                surface_y = top_edge_verts[nearest, 1]   # tensor — keeps grad
+                penetration = surface_y - v[1]
+                if penetration.item() > 0:
+                    energy = energy + self.k_collision * penetration ** 2
 
             energy.backward()
 

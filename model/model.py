@@ -9,7 +9,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from sim.configs import ModelConfig
+from training.configs import ModelConfig
 from model.encoder import ScanEncoder
 from model.decoder import StiffnessDecoder
 

@@ -1,10 +1,18 @@
 """
-Configuration dataclasses for the arthroscopy POC simulation.
+Configuration dataclasses for the arthroscopy simulation.
 
-All configs are designed for use with pyrallis (YAML ↔ dataclass).
+All configs are designed for use with pyrallis (YAML <-> dataclass).
+
+This module covers the *simulation* side only: probe trajectories, the FEM
+tissue phantom, the physics engine, and the top-level experiment config that
+ties them together.
+
+Related config modules:
+  - data.configs     -> dataset generation (DatasetConfig)
+  - training.configs -> model + training (ModelConfig, TrainingConfig)
 """
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +48,20 @@ class SimulationConfig:
     save_images: bool = False
     save_video: bool = False
     opaque_model: bool = False
+
+    # ------------------------------------------------------------------
+    # Sensor / contact model
+    #
+    # These live here (rather than on ProbeConfig) because they are
+    # consumed directly by SoftObjectSimulation.get_sensor_reading(), which
+    # only has access to SimulationConfig — not the probe's own config.
+    # ------------------------------------------------------------------
+    friction_coeff: float = 0.0                # Coulomb friction coefficient mu.
+                                                # 0.0 = frictionless (legacy behaviour, Fx == 0).
+    shaft_length: float = 0.0                  # Distance L from the probe-tip centre to the
+                                                # F/T sensor, measured along the probe's vertical
+                                                # shaft axis (+y). 0.0 = sensor co-located with the
+                                                # tip (legacy behaviour).
 
 
 # ---------------------------------------------------------------------------
@@ -83,68 +105,3 @@ class ExperimentConfig:
     tissue: TissueConfig = field(default_factory=TissueConfig)
     probe: ProbeConfig = field(default_factory=ProbeConfig)
     simulation: SimulationConfig = field(default_factory=SimulationConfig)
-
-
-# ---------------------------------------------------------------------------
-# Dataset generation
-# ---------------------------------------------------------------------------
-
-@dataclass
-class DatasetConfig:
-    """Controls parallel dataset generation."""
-    data_folder: str = "./data/dataset"
-    num_experiments: int = 1000
-    start_index: int = 0
-    num_processes: int = 8
-    num_scan_positions: int = 10      # probe poke locations evenly spaced across width
-    frames_per_poke: int = 10         # frames per individual poke trajectory
-    penetration: float = 0.95         # how deep the probe goes (fraction of tissue height)
-    experiment_config_path: str = "configs/default.yaml"
-
-
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
-
-@dataclass
-class EncoderConfig:
-    """1D-CNN encoder for per-poke force/torque sequences."""
-    input_dim: int = 3          # (Fx, Fy, Mz) per frame
-    hidden_dim: int = 64
-    num_layers: int = 3
-    kernel_size: int = 3
-    dropout: float = 0.1
-
-
-@dataclass
-class DecoderConfig:
-    """MLP decoder: latent → stiffness profile."""
-    hidden_dim: int = 128
-    num_layers: int = 2
-    output_dim: int = 5         # = n_zones; overridden at runtime from TissueConfig
-
-
-@dataclass
-class ModelConfig:
-    encoder: EncoderConfig = field(default_factory=EncoderConfig)
-    decoder: DecoderConfig = field(default_factory=DecoderConfig)
-
-
-# ---------------------------------------------------------------------------
-# Training
-# ---------------------------------------------------------------------------
-
-@dataclass
-class TrainingConfig:
-    data_path: str = "./data/dataset.h5"
-    output_dir: str = "./runs/exp_001"
-    epochs: int = 100
-    batch_size: int = 32
-    learning_rate: float = 1e-3
-    weight_decay: float = 1e-4
-    lr_scheduler: str = "cosine"   # "cosine" | "step" | "none"
-    val_split: float = 0.15
-    test_split: float = 0.10
-    seed: int = 42
-    num_workers: int = 4
-    model: ModelConfig = field(default_factory=ModelConfig)
