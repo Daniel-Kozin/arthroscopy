@@ -17,6 +17,7 @@ Usage:
 import argparse
 import contextlib
 import io
+import math
 import multiprocessing
 import os
 import pickle
@@ -29,8 +30,10 @@ from data.configs import DatasetConfig
 from sim.configs import ExperimentConfig, SimulationConfig
 from sim.tissue import build_tissue, scan_probe_positions
 from sim.shapes import create_circular_probe
-from sim.simulation import SoftObjectSimulation
+from sim.simulation import SoftObjectSimulation, BadAngleError
 from sim.trajectory import TwoPointTrajectory, ThreePointTrajectory, poke_trajectory_points
+
+MAX_ANGLE_RESAMPLE_ATTEMPTS = 10
 
 
 def run_single_experiment(
@@ -69,57 +72,99 @@ def run_single_experiment(
     )
 
     tissue_top_y = exp_config.tissue.height
-    hover_height = exp_config.probe.radius * 3
-    penetration_depth = exp_config.probe.radius * 0.8
+    hover_height = exp_config.probe.hover_height
+    # poke_trajectory_points() works in terms of the probe CENTRE's travel,
+    # so convert the configured TIP penetration depth by subtracting radius.
+    center_penetration_depth = exp_config.probe.tip_penetration_depth - exp_config.probe.radius
 
     all_poke_readings: list[np.ndarray] = []  # list of (frames_per_poke, 3) arrays
 
     for pos_idx, x_pos in enumerate(x_positions):
-        # Reset tissue to rest state before each poke
-        tissue.reset_positions()
+        for attempt in range(MAX_ANGLE_RESAMPLE_ATTEMPTS):
+            # Reset tissue to rest state before each (re)attempted poke
+            tissue.reset_positions()
 
-        # Build poke trajectory (down + up)
-        pts = poke_trajectory_points(x_pos, tissue_top_y, hover_height, penetration_depth)
-        T = dataset_config.frames_per_poke * exp_config.simulation.dt
+            if not math.isnan(exp_config.probe.probe_angle_deg):
+                theta_deg = exp_config.probe.probe_angle_deg
+            else:
+                theta_deg = float(rng.uniform(
+                    exp_config.probe.angle_min_deg, exp_config.probe.angle_max_deg
+                ))
 
-        # Go down
-        down_traj = TwoPointTrajectory(T=T / 2, x0=pts[0][0], y0=pts[0][1], x1=pts[1][0], y1=pts[1][1])
-        # Go back up
-        up_traj = TwoPointTrajectory(T=T / 2, x0=pts[1][0], y0=pts[1][1], x1=pts[0][0], y1=pts[0][1])
-
-        poke_readings: list[np.ndarray] = []
-
-        for traj, n_frames in [(down_traj, dataset_config.frames_per_poke // 2),
-                                (up_traj, dataset_config.frames_per_poke // 2)]:
-            probe = create_circular_probe(
-                radius=exp_config.probe.radius,
-                num_points=exp_config.probe.num_points,
-                x_center=pts[0][0],
-                y_center=pts[0][1],
-                trajectory=traj,
+            # Build poke trajectory (down + up), tilted by theta_deg from vertical
+            pts = poke_trajectory_points(
+                x_pos, tissue_top_y, hover_height, center_penetration_depth, angle_deg=theta_deg
             )
+            T = dataset_config.frames_per_poke * exp_config.simulation.dt
 
-            sim_config = SimulationConfig(
-                collision_spring_constant=exp_config.simulation.collision_spring_constant,
-                steps=exp_config.simulation.steps,
-                dt=exp_config.simulation.dt,
-                learning_rate=exp_config.simulation.learning_rate,
-                adam_beta_1=exp_config.simulation.adam_beta_1,
-                adam_beta_2=exp_config.simulation.adam_beta_2,
-                warmup=exp_config.simulation.warmup,
-                probe_force_noise_std=exp_config.simulation.probe_force_noise_std,
-                frames=n_frames,
-                save_vectors=True,
-                save_images=False,
-                save_video=False,
+            # Go down
+            down_traj = TwoPointTrajectory(T=T / 2, x0=pts[0][0], y0=pts[0][1], x1=pts[1][0], y1=pts[1][1])
+            # Go back up
+            up_traj = TwoPointTrajectory(T=T / 2, x0=pts[1][0], y0=pts[1][1], x1=pts[0][0], y1=pts[0][1])
+
+            poke_readings: list[np.ndarray] = []
+            any_contact = False
+
+            for (traj, start_pt), n_frames in [
+                ((down_traj, pts[0]), dataset_config.frames_per_poke // 2),
+                ((up_traj, pts[1]), dataset_config.frames_per_poke // 2),
+            ]:
+                probe = create_circular_probe(
+                    radius=exp_config.probe.radius,
+                    num_points=exp_config.probe.num_points,
+                    x_center=start_pt[0],
+                    y_center=start_pt[1],
+                    trajectory=traj,
+                )
+
+                sim_config = SimulationConfig(
+                    collision_spring_constant=exp_config.simulation.collision_spring_constant,
+                    steps=exp_config.simulation.steps,
+                    dt=exp_config.simulation.dt,
+                    learning_rate=exp_config.simulation.learning_rate,
+                    adam_beta_1=exp_config.simulation.adam_beta_1,
+                    adam_beta_2=exp_config.simulation.adam_beta_2,
+                    warmup=exp_config.simulation.warmup,
+                    probe_force_noise_std=exp_config.simulation.probe_force_noise_std,
+                    probe_angle_deg=theta_deg,
+                    frames=n_frames,
+                    save_vectors=True,
+                    save_images=False,
+                    save_video=False,
+                )
+
+                sim = SoftObjectSimulation([tissue, probe], sim_config)
+                for _ in range(n_frames):
+                    sim.step()
+                    if sim.get_contact_point() is not None:
+                        any_contact = True
+                    poke_readings.append(sim.get_aggregated_sensor())
+
+            if any_contact:
+                break
+
+            # Bad angle: the probe never touched the tissue during this poke.
+            if not math.isnan(exp_config.probe.probe_angle_deg):
+                raise BadAngleError(
+                    f"Configured probe_angle_deg={theta_deg:.1f} never makes contact "
+                    f"at poke x_pos={x_pos:.3f} (experiment {exp_idx}, pos {pos_idx})."
+                )
+            log.append(
+                f"  pos {pos_idx}: x={x_pos:.3f} angle={theta_deg:.1f} -> bad angle "
+                f"(no contact), resampling (attempt {attempt + 1}/{MAX_ANGLE_RESAMPLE_ATTEMPTS})"
             )
-
-            sim = SoftObjectSimulation([tissue, probe], sim_config)
-            readings = sim.run()
-            poke_readings.extend(readings)
+        else:
+            raise BadAngleError(
+                f"Could not find a contact-making probe angle for poke "
+                f"x_pos={x_pos:.3f} (experiment {exp_idx}, pos {pos_idx}) after "
+                f"{MAX_ANGLE_RESAMPLE_ATTEMPTS} attempts."
+            )
 
         all_poke_readings.append(np.stack(poke_readings, axis=0))  # (frames_per_poke, 3)
-        log.append(f"  pos {pos_idx}: x={x_pos:.3f}  max_force={np.abs(poke_readings).max():.4f}")
+        log.append(
+            f"  pos {pos_idx}: x={x_pos:.3f} angle={theta_deg:.1f}  "
+            f"max_force={np.abs(poke_readings).max():.4f}"
+        )
 
     # all_poke_readings: list of length n_scan_positions, each (frames_per_poke, 3)
     sensor_array = np.stack(all_poke_readings, axis=0)  # (n_positions, frames_per_poke, 3)

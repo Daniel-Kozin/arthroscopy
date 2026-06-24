@@ -141,18 +141,32 @@ def poke_trajectory_points(
     tissue_top_y: float,
     hover_height: float = 0.1,
     penetration_depth: float = 0.05,
+    angle_deg: float = 0.0,
 ) -> list[tuple[float, float]]:
     """
-    Returns [start, end] for a vertical poke at a given x position.
+    Returns [start, end] for a (possibly tilted) poke at a given x position.
 
     Args:
-        x_pos: x coordinate of the poke
+        x_pos: x coordinate of the poke (at the START/hover point)
         tissue_top_y: y coordinate of the tissue surface
         hover_height: how far above tissue the probe starts
         penetration_depth: how deep below the surface the probe goes
+            (penetration is measured vertically, i.e. end_y = tissue_top_y -
+            penetration_depth, regardless of angle)
+        angle_deg: tilt of the poke direction from vertical, in degrees.
+            0 = straight down. Positive angles tilt the approach direction
+            toward +x, so the end point is shifted in +x.
     """
     start = (x_pos, tissue_top_y + hover_height)
-    end = (x_pos, tissue_top_y - penetration_depth)
+    if angle_deg == 0.0:
+        end = (x_pos, tissue_top_y - penetration_depth)
+    else:
+        theta = math.radians(angle_deg)
+        # Travel along the tilted direction d = (sin(theta), -cos(theta)) such
+        # that the vertical drop equals hover_height + penetration_depth.
+        vertical_drop = hover_height + penetration_depth
+        x_shift = vertical_drop * math.tan(theta)
+        end = (x_pos + x_shift, tissue_top_y - penetration_depth)
     return [start, end]
 
 
@@ -161,8 +175,10 @@ def return_poke_points(
     tissue_top_y: float,
     hover_height: float = 0.1,
     penetration_depth: float = 0.05,
+    angle_deg: float = 0.0,
 ) -> list[tuple[float, float]]:
-    """Poke-and-return: go down and come back up."""
-    start = (x_pos, tissue_top_y + hover_height)
-    bottom = (x_pos, tissue_top_y - penetration_depth)
+    """Poke-and-return: go down (possibly tilted) and come back up."""
+    start, bottom = poke_trajectory_points(
+        x_pos, tissue_top_y, hover_height, penetration_depth, angle_deg
+    )
     return [start, bottom, start]

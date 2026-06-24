@@ -6,6 +6,7 @@ Key change vs. breast project:
   - get_sensor_reading() returns (Fx, Fy, Mz) instead of just (Fx, Fy).
     Mz is the moment of the contact forces about the probe center.
 """
+import math
 import os
 import pickle
 from typing import Optional
@@ -17,6 +18,10 @@ from matplotlib.animation import FuncAnimation
 
 from sim.shapes import SoftShape
 from sim.configs import SimulationConfig
+
+
+class BadAngleError(Exception):
+    """Raised when a tilted poke never makes contact with the tissue."""
 
 
 class SoftObjectSimulation:
@@ -105,11 +110,29 @@ class SoftObjectSimulation:
         Returns a (N_probe_verts, 3) array of [Fx, Fy, Mz] per probe vertex.
 
         Force model: for each probe vertex that is below the deformed tissue
-        surface, the tissue pushes the probe upward with a normal reaction
-        Fy = 2k * penetration (consistent with the collision energy
-        E = k * penetration²). If `friction_coeff` (mu) > 0, a Coulomb
-        tangential reaction Fx = -mu * Fy * sign(vx_probe) opposes the
-        probe's horizontal sliding motion (vx_probe == 0 -> Fx = 0).
+        surface, the tissue pushes the probe with a normal reaction
+        Fn = 2k * penetration (consistent with the collision energy
+        E = k * penetration²), where penetration is still measured vertically
+        (surface_y - vertex_y).
+
+        Tilted-normal decomposition (probe_angle_deg = theta)
+        ─────────────────────────────────────────────────────
+        When the probe pokes at a tilt theta from vertical (0 = straight
+        down, +theta tilts the DESCENT direction toward +x, so the probe
+        travels along (+sin(theta), -cos(theta))), we assume the soft
+        tissue's effective contact normal tilts by theta as well, and the
+        normal reaction (Newton's 3rd law) points opposite to the probe's
+        direction of travel:
+            fy = Fn * cos(theta)
+            fx_normal = -Fn * sin(theta)
+        At theta = 0 this reduces exactly to the legacy model (fx_normal = 0,
+        fy = Fn).
+
+        If `friction_coeff` (mu) > 0, a Coulomb tangential reaction
+        Fx_friction = -mu * Fy * sign(vx_probe) opposes the probe's
+        horizontal sliding motion (vx_probe == 0 -> Fx_friction = 0), and is
+        added to fx_normal. (No tilt-dependent friction model — out of
+        scope.)
 
         Sensor wrench transform (probe tip -> remote F/T sensor on the shaft)
         ─────────────────────────────────────────────────────────────────────
@@ -143,6 +166,8 @@ class SoftObjectSimulation:
         probe_center = probe_verts.mean(axis=0)
         noise_std = self.config.probe_force_noise_std
         mu = self.config.friction_coeff
+        theta = math.radians(self.config.probe_angle_deg)
+        cos_theta, sin_theta = math.cos(theta), math.sin(theta)
 
         # Sensor point: offset from the probe centre along the shaft's
         # vertical axis. L=0 -> sensor co-located with the tip (legacy).
@@ -165,8 +190,9 @@ class SoftObjectSimulation:
                 penetration = -1.0
 
             if penetration > 0:
-                fy = 2.0 * self.k_collision * penetration   # normal reaction
-                fx = -mu * fy * slip_sign                    # Coulomb friction reaction
+                fn = 2.0 * self.k_collision * penetration    # normal reaction magnitude
+                fy = fn * cos_theta
+                fx = -fn * sin_theta + (-mu * fy * slip_sign)  # tilt + Coulomb friction
             else:
                 fx, fy = 0.0, 0.0
 

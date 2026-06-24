@@ -2,6 +2,8 @@
 Smoke tests for the simulation stack.
 Run with: pytest tests/
 """
+import math
+
 import numpy as np
 import pytest
 import torch
@@ -9,8 +11,8 @@ import torch
 from sim.configs import TissueConfig, SimulationConfig, ExperimentConfig
 from sim.tissue import build_tissue, scan_probe_positions, build_rectangle_mesh
 from sim.shapes import create_circular_probe, SoftShapeFiniteElement
-from sim.trajectory import TwoPointTrajectory, StaticTrajectory
-from sim.simulation import SoftObjectSimulation
+from sim.trajectory import TwoPointTrajectory, StaticTrajectory, poke_trajectory_points
+from sim.simulation import SoftObjectSimulation, BadAngleError
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +114,8 @@ def test_sensor_reading_shape():
 # makes the expected results exact (to float precision), not approximate.
 # ---------------------------------------------------------------------------
 
-def _contact_sim(friction_coeff: float = 0.0, shaft_length: float = 0.0) -> SoftObjectSimulation:
+def _contact_sim(friction_coeff: float = 0.0, shaft_length: float = 0.0,
+                  probe_angle_deg: float = 0.0) -> SoftObjectSimulation:
     """Probe resting with its lower half penetrating a flat tissue surface."""
     tissue_config = TissueConfig(width=1.0, height=0.3, grid_size=0.1, n_zones=1)
     sim_config = SimulationConfig(
@@ -123,6 +126,7 @@ def _contact_sim(friction_coeff: float = 0.0, shaft_length: float = 0.0) -> Soft
         probe_force_noise_std=0.0,
         friction_coeff=friction_coeff,
         shaft_length=shaft_length,
+        probe_angle_deg=probe_angle_deg,
     )
     tissue, _ = build_tissue(tissue_config, rng=np.random.default_rng(0))
     probe = create_circular_probe(
@@ -211,3 +215,108 @@ def test_sensor_moment_sign_convention():
             assert mz == pytest.approx(dx * fy, abs=1e-6)
             assert mz > 0
     assert found_right_side_contact  # sanity: this scenario actually occurs
+
+
+# ---------------------------------------------------------------------------
+# Tilted poke: contact-normal decomposition into (Fx, Fy)
+#
+#   Fn = 2k * penetration (vertical penetration, unchanged)
+#   Fy = Fn * cos(theta)
+#   Fx = Fn * sin(theta)
+# ---------------------------------------------------------------------------
+
+def test_tilt_zero_angle_is_legacy_behaviour():
+    """theta=0 must reproduce the pre-tilt model exactly: Fx == 0, Fy > 0
+    for a vertex in contact."""
+    sim = _contact_sim(probe_angle_deg=0.0)
+
+    _, fy, _ = sim.get_aggregated_sensor()
+    assert fy > 0
+
+    for fx, fy_i, _ in sim.get_sensor_reading():
+        if fy_i > 0:
+            assert fx == pytest.approx(0.0, abs=1e-9)
+
+
+@pytest.mark.parametrize("theta_deg", [15.0, 30.0])
+def test_tilt_positive_angle_gives_fx_with_expected_ratio(theta_deg):
+    """For theta > 0, contact vertices get Fx < 0, Fy > 0 (reaction opposes
+    the probe's direction of travel, Newton's 3rd law), with
+    Fx / Fy == -tan(theta) exactly (Fn cancels in the ratio)."""
+    sim = _contact_sim(probe_angle_deg=theta_deg)
+
+    found_contact = False
+    for fx, fy, _ in sim.get_sensor_reading():
+        if fy > 0:
+            found_contact = True
+            assert fx < 0
+            assert fx / fy == pytest.approx(-math.tan(math.radians(theta_deg)), rel=1e-5)
+    assert found_contact
+
+
+def test_tilt_sign_flips_with_negative_angle():
+    """Flipping the sign of theta flips the sign of Fx, leaving Fy unchanged."""
+    sim_pos = _contact_sim(probe_angle_deg=20.0)
+    sim_neg = _contact_sim(probe_angle_deg=-20.0)
+
+    fx_pos, fy_pos, _ = sim_pos.get_aggregated_sensor()
+    fx_neg, fy_neg, _ = sim_neg.get_aggregated_sensor()
+
+    assert fx_pos < 0
+    assert fx_neg > 0
+    assert fx_neg == pytest.approx(-fx_pos, rel=1e-5)
+    assert fy_neg == pytest.approx(fy_pos, rel=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Tilted trajectory geometry
+# ---------------------------------------------------------------------------
+
+def test_poke_trajectory_points_zero_angle_unchanged():
+    """angle_deg=0 reproduces the original straight-down trajectory exactly."""
+    pts = poke_trajectory_points(1.0, tissue_top_y=0.4, hover_height=0.15, penetration_depth=0.04, angle_deg=0.0)
+    assert pts[0] == (1.0, 0.55)
+    assert pts[1][0] == pytest.approx(1.0)
+    assert pts[1][1] == pytest.approx(0.36)
+
+
+def test_poke_trajectory_points_tilted():
+    """A tilted poke keeps the vertical penetration depth but shifts the
+    end point in x by (hover_height + penetration_depth) * tan(theta)."""
+    hover, pen, theta_deg = 0.15, 0.04, 30.0
+    start, end = poke_trajectory_points(1.0, tissue_top_y=0.4, hover_height=hover,
+                                          penetration_depth=pen, angle_deg=theta_deg)
+    assert start == (1.0, 0.55)
+    assert end[1] == pytest.approx(0.4 - pen)
+    expected_shift = (hover + pen) * math.tan(math.radians(theta_deg))
+    assert end[0] == pytest.approx(1.0 + expected_shift)
+
+
+# ---------------------------------------------------------------------------
+# Bad-angle detection
+# ---------------------------------------------------------------------------
+
+def test_bad_angle_raises(tmp_path):
+    """A fixed, extreme tilt angle carries the probe off the tissue for any
+    scan position, so no frame ever makes contact -> BadAngleError."""
+    from data.configs import DatasetConfig
+    from sim.configs import ExperimentConfig, TissueConfig, ProbeConfig
+    from sim.generate_dataset import run_single_experiment
+
+    exp_config = ExperimentConfig(
+        tissue=TissueConfig(width=1.0, height=0.3, grid_size=0.1, n_zones=1),
+        probe=ProbeConfig(
+            num_points=8, radius=0.04, hover_height=0.1, tip_penetration_depth=0.05,
+            probe_angle_deg=89.0,  # tan(89 deg) ~ 57 -> end point shifted far off tissue
+        ),
+    )
+    exp_config.simulation.steps = 2
+    exp_config.simulation.warmup = False
+
+    dataset_config = DatasetConfig(
+        data_folder=str(tmp_path), num_experiments=1, num_processes=1,
+        num_scan_positions=1, frames_per_poke=2,
+    )
+
+    with pytest.raises(BadAngleError):
+        run_single_experiment(0, str(tmp_path), dataset_config, exp_config, np.random.default_rng(0))

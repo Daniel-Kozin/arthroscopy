@@ -11,6 +11,7 @@ Related config modules:
   - data.configs     -> dataset generation (DatasetConfig)
   - training.configs -> model + training (ModelConfig, TrainingConfig)
 """
+import math
 from dataclasses import dataclass, field
 from typing import List
 
@@ -62,6 +63,11 @@ class SimulationConfig:
                                                 # F/T sensor, measured along the probe's vertical
                                                 # shaft axis (+y). 0.0 = sensor co-located with the
                                                 # tip (legacy behaviour).
+    probe_angle_deg: float = 0.0               # Tilt of the poke approach direction from
+                                                # vertical (degrees, +x is positive). Used to
+                                                # decompose the contact normal reaction into
+                                                # (Fx, Fy). 0.0 = straight-down poke (legacy
+                                                # behaviour, Fx from tilt == 0).
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +97,24 @@ class ProbeConfig:
     """Circular tip probe (simplified from the arthroscopic instrument)."""
     num_points: int = 8        # vertices on the circular tip
     radius: float = 0.05       # probe tip radius
+    hover_height: float = 0.15      # y-distance above the tissue surface where
+                                     # a poke starts and ends
+    tip_penetration_depth: float = 0.09 # y-distance the probe TIP (its lowest
+                                     # point, i.e. centre - radius) goes below
+                                     # the (rest) tissue surface at the bottom
+                                     # of a poke
+
+    # ------------------------------------------------------------------
+    # Poke tilt angle (degrees from vertical, +x direction is positive)
+    # ------------------------------------------------------------------
+    # Fixed tilt angle in degrees. NaN (the default) means "sample uniformly
+    # in [angle_min_deg, angle_max_deg] per poke using the experiment's seeded
+    # RNG". (pyrallis does not support Optional[float] cleanly, hence the NaN
+    # sentinel — check with math.isnan().)
+    probe_angle_deg: float = math.nan
+    angle_min_deg: float = -45.0
+    angle_max_deg: float = 45.0
+
     trajectories: TrajectoriesConfig = field(
         default_factory=lambda: TrajectoriesConfig(type=[], frames=[], params=[])
     )
