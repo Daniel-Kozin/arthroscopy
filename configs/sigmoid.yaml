@@ -1,0 +1,47 @@
+tissue:
+  width: 2.0
+  height: 0.4
+  grid_size: 0.08
+  n_columns: 128            # 128 stiffness rectangle columns (mesh-aligned)
+  n_zones: 5
+  poisson_ratio: 0.45
+  poisson_ratio_var: 0.005
+  young_modulus_min: 0.002
+  young_modulus_max: 0.02
+  young_modulus_var: 0.0002
+  sigmoid:
+    k_min: 2.0              # shallowest gradient
+    k_max: 500.0            # steepest (near-step) transition
+    x0_margin: 0.2          # keep transition centre away from edges
+
+probe:
+  num_points: 8
+  radius: 0.05
+  hover_height: 0.15
+  tip_penetration_depth: 0.09
+  probe_angle_deg: .nan
+  angle_min_deg: -45.0
+  angle_max_deg: 45.0
+  trajectories:
+    type: []
+    frames: []
+    params: []
+
+simulation:
+  collision_spring_constant: 0.02
+  steps: 500
+  dt: 0.1
+  learning_rate: 0.001
+  adam_beta_1: 0.2
+  adam_beta_2: 0.999
+  warmup: true
+  probe_force_noise_std: 0.00001
+  observation_noise: 0.0
+  frames: 0
+  save_folder: ./data/sim_out
+  save_vectors: true
+  save_images: false
+  save_video: false
+  opaque_model: false
+  friction_coeff: 0.0
+  shaft_length: 0.0

@@ -98,10 +98,13 @@ class SoftShapeFiniteElement(SoftShape):
 
         # Build edge list (no duplicates)
         self.links = []
+        seen_links = set()
         for t in self.triangles:
             for i in range(3):
                 v1, v2 = int(t[i]), int(t[(i + 1) % 3])
-                if (v1, v2) not in self.links and (v2, v1) not in self.links:
+                key = (v1, v2) if v1 < v2 else (v2, v1)
+                if key not in seen_links:
+                    seen_links.add(key)
                     self.links.append((v1, v2))
 
         self.edges = self._compute_edges()
@@ -113,6 +116,37 @@ class SoftShapeFiniteElement(SoftShape):
 
         self.poisson_ratio = torch.full((n_tri,), default_poisson_ratio, dtype=torch.float32)
         self.poisson_ratio += torch.rand(n_tri) * 2 * poisson_ratio_var - poisson_ratio_var
+
+        self._precompute_fem_matrices()
+
+    def _precompute_fem_matrices(self):
+        """
+        Precompute per-triangle rest areas and strain-displacement matrices B
+        (they depend only on the rest configuration) so _strain_energy() can
+        run batched every optimizer step instead of looping over triangles.
+        """
+        self._tri_index = torch.tensor(np.ascontiguousarray(self.triangles), dtype=torch.long)
+        v_ref = self.original_positions[self._tri_index]        # (T, 3, 2)
+        x, y = v_ref[:, :, 0], v_ref[:, :, 1]                   # (T, 3)
+
+        area = 0.5 * torch.abs(
+            (x[:, 1] - x[:, 0]) * (y[:, 2] - y[:, 0])
+            - (x[:, 2] - x[:, 0]) * (y[:, 1] - y[:, 0])
+        )                                                        # (T,)
+
+        n_tri = v_ref.shape[0]
+        B = torch.zeros((n_tri, 3, 6))
+        for i in range(3):
+            j, k = (i + 1) % 3, (i + 2) % 3
+            B[:, 0, 2 * i]     = y[:, j] - y[:, k]
+            B[:, 1, 2 * i + 1] = x[:, k] - x[:, j]
+            B[:, 2, 2 * i]     = B[:, 1, 2 * i + 1]
+            B[:, 2, 2 * i + 1] = B[:, 0, 2 * i]
+        B = B / (2 * area)[:, None, None]
+
+        self._tri_areas = area
+        self._B = B
+        self._ref_flat = v_ref.reshape(n_tri, 6)
 
     def _compute_edges(self):
         bi = self.boundary_idx
@@ -140,12 +174,16 @@ class SoftShapeFiniteElement(SoftShape):
         assert len(zone_young_moduli) == len(zone_boundaries) - 1
 
         vertices_np = self.original_positions.numpy()
-        for i, tri in enumerate(self.triangles):
-            centroid_x = float(vertices_np[tri, 0].mean())
-            for z, (x_lo, x_hi) in enumerate(zip(zone_boundaries[:-1], zone_boundaries[1:])):
-                if x_lo <= centroid_x < x_hi:
-                    self.young_modulus[i] = zone_young_moduli[z]
-                    break
+        centroid_x = vertices_np[self.triangles, 0].mean(axis=1)      # (T,)
+        bounds = np.asarray(zone_boundaries, dtype=np.float64)
+        zone_idx = np.searchsorted(bounds, centroid_x, side="right") - 1
+        valid = (zone_idx >= 0) & (zone_idx < len(zone_young_moduli))
+
+        moduli = np.asarray(zone_young_moduli, dtype=np.float32)
+        tri_ids = np.nonzero(valid)[0]
+        self.young_modulus[torch.from_numpy(tri_ids)] = torch.from_numpy(
+            moduli[zone_idx[tri_ids]]
+        )
 
     # ------------------------------------------------------------------
     # Dynamics
@@ -163,7 +201,30 @@ class SoftShapeFiniteElement(SoftShape):
         return self._strain_energy()
 
     def _strain_energy(self):
-        """Linear elastic strain energy summed over all triangles."""
+        """
+        Linear elastic strain energy summed over all triangles (batched).
+
+        Numerically equivalent to _strain_energy_reference() (see test suite)
+        but runs as a handful of batched tensor ops instead of a Python loop —
+        required for fine meshes (e.g. 128 columns ≈ 6.6k triangles).
+        """
+        disp = self.vertices[self._tri_index].reshape(-1, 6) - self._ref_flat   # (T, 6)
+        strain = torch.einsum("tij,tj->ti", self._B, disp)                      # (T, 3)
+
+        E, nu = self.young_modulus, self.poisson_ratio
+        c = E / (1 - nu ** 2)
+        stress_0 = c * (strain[:, 0] + nu * strain[:, 1])
+        stress_1 = c * (nu * strain[:, 0] + strain[:, 1])
+        stress_2 = c * ((1 - nu) / 2) * strain[:, 2]
+
+        stress_dot_strain = (
+            stress_0 * strain[:, 0] + stress_1 * strain[:, 1] + stress_2 * strain[:, 2]
+        )
+        return (0.5 * stress_dot_strain * 2 * self._tri_areas).sum()
+
+    def _strain_energy_reference(self):
+        """Original per-triangle loop implementation. Kept as the ground truth
+        for testing the batched _strain_energy(); do not use in hot paths."""
         energy = torch.tensor(0.0)
         for tri, E, nu in zip(self.triangles, self.young_modulus, self.poisson_ratio):
             v_cur = self.vertices[tri]           # (3, 2)

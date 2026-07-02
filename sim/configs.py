@@ -75,17 +75,40 @@ class SimulationConfig:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class SigmoidFieldConfig:
+    """
+    Parameters for the sigmoid stiffness field:
+
+        E(x) = E_left + (E_right - E_left) * sigmoid(k * (x - x0))
+
+    k -> infinity recovers a sharp two-rectangle step at x0 (the old
+    n_zones=2 case); small k gives a smooth stiffness gradient.
+    E_left / E_right are sampled from TissueConfig's
+    [young_modulus_min, young_modulus_max]; x0 is sampled uniformly in
+    [x0_margin, width - x0_margin] and snapped to the nearest mesh grid
+    line so the transition always aligns with mesh columns.
+    """
+    k_min: float = 2.0                    # shallowest gradient (transition width ~4/k ≈ whole tissue)
+    k_max: float = 500.0                  # steepest gradient (transition narrower than one mesh column)
+    x0_margin: float = 0.2                # keep the transition centre away from the tissue edges
+
+
+@dataclass
 class TissueConfig:
     """Rectangle tissue phantom with N stiffness zones."""
     width: float = 2.0                    # long dimension (x-axis)
     height: float = 0.4                   # short dimension (y-axis)
     grid_size: float = 0.08               # mesh spacing
+    n_columns: int = 0                    # if > 0, mesh has exactly this many cells along x
+                                          # (cells kept ~square; grid_size then only applies
+                                          # to legacy paths). 0 = derive from grid_size.
     n_zones: int = 5                      # number of stiffness zones along width
     poisson_ratio: float = 0.45           # background Poisson's ratio
     poisson_ratio_var: float = 0.005      # per-element variation
     young_modulus_min: float = 0.002      # minimum zone Young's modulus
     young_modulus_max: float = 0.02       # maximum zone Young's modulus
     young_modulus_var: float = 0.0002     # per-element within-zone variation
+    sigmoid: SigmoidFieldConfig = field(default_factory=SigmoidFieldConfig)
 
 
 # ---------------------------------------------------------------------------

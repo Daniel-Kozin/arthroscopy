@@ -21,7 +21,8 @@ arthroscopy_poc/
 ├── CLAUDE.md               ← you are here
 ├── pyproject.toml          ← dependencies + packaging
 ├── configs/
-│   └── default.yaml        ← default simulation config
+│   ├── default.yaml        ← default simulation config
+│   └── sigmoid.yaml        ← 128-column sigmoid stiffness field config
 ├── sim/                    ← simulation module
 │   ├── configs.py          ← simulation config dataclasses (Tissue, Probe, Simulation, Experiment)
 │   ├── trajectory.py       ← probe movement trajectories
@@ -123,7 +124,25 @@ Load from YAML: `pyrallis.parse(config_class=ExperimentConfig, config_path="conf
 
 ---
 
-## Current Status (as of project init)
+## Sigmoid Stiffness Field (current direction)
+The label moved from N independent zone E values to a parametric sigmoid profile:
+
+    E(x) = E_left + (E_right - E_left) * sigmoid(k * (x - x0))
+
+- Implemented in `sim/tissue.py` (`build_tissue_sigmoid`, `SigmoidFieldParams`)
+  + `SigmoidFieldConfig` in `sim/configs.py`; preset: `configs/sigmoid.yaml`.
+- Discretized to one E per mesh column: `TissueConfig.n_columns=128` -> 128 thin
+  rectangles, each exactly aligned with mesh cells.
+- k -> infinity is a hard 2-rectangle step at x0 (subsumes the old n_zones=2 case);
+  k is sampled log-uniform in [k_min, k_max].
+- x0 (and any legacy zone boundary) is SNAPPED to the nearest mesh grid line so
+  zones are always perfect rectangles (`zone_boundaries_snapped`, `snap_to_grid`).
+- Ground-truth label per experiment: (E_left, E_right, x0, k). Prediction target: k
+  (possibly + the rest). Model/dataset wiring for this: not done yet.
+- Viewer: `visualize_tissue.py` — `--mode gallery` (E-field across k values, no sim),
+  `--mode poke` (animated poke on a sigmoid tissue).
+
+## Current Status
 - [x] Simulation core (FEM, shapes, trajectories)
 - [x] Rectangle tissue phantom with stiffness zones
 - [x] Force/torque sensor model (Fx, Fy, Mz)
@@ -132,7 +151,11 @@ Load from YAML: `pyrallis.parse(config_class=ExperimentConfig, config_path="conf
 - [x] PyTorch Dataset + DataLoader
 - [x] Encoder (1D-CNN per poke) + Decoder (MLP)
 - [x] Training loop
-- [ ] **First run**: generate dataset, sanity-check sensor signals
+- [x] Vectorized FEM strain energy (batched torch; 128-column mesh ≈ 6.6k triangles
+      runs a full 16-frame poke in a few seconds)
+- [x] Sigmoid stiffness field + grid-aligned zone fix + `visualize_tissue.py`
+- [ ] Dataset generation with sigmoid labels (k, E_left, E_right, x0)
+- [ ] Decide prediction target(s) + adapt model/decoder to sigmoid labels
 - [ ] Tune simulation params (collision_spring_constant, steps, penetration_depth)
 - [ ] Evaluate model, analyse what the encoder learns
 - [ ] Decide on final model architecture (may replace CNN with Transformer)
